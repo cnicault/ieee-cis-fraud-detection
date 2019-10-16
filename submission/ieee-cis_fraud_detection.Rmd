@@ -1,0 +1,971 @@
+---
+title: "ieee-cis Fraud Detection"
+author: "Christophe Nicault"
+date: "22 août 2019"
+output:
+  html_document:
+    toc: TRUE
+    number_sections: TRUE
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r load_libraries, echo=T, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(janitor)
+library(scales)
+library(lubridate)
+library(here)
+
+theme_update(plot.title = element_text(hjust = 0.5),
+             plot.subtitle = element_text(hjust = 0.5))
+```
+
+
+```{r load_data}
+
+char_columns <- cols(ProductCD = col_character(),
+                    card1 = col_character(),
+                    card2 = col_character(),
+                    card3 = col_character(),
+                    card4 = col_character(),
+                    card5 = col_character(),
+                    card6 = col_character(),
+                    addr1 = col_character(),
+                    addr2 = col_character(),
+                    M1 = col_character(),
+                    M2 = col_character(),
+                    M3 = col_character(),
+                    M4 = col_character(),
+                    M5 = col_character(),
+                    M6 = col_character(),
+                    M7 = col_character(),
+                    M8 = col_character(),
+                    M9 = col_character(),
+                    .default = col_guess())
+
+train_transaction <- read_csv("train_transaction.csv", col_types = char_columns)
+train_identity <- read_csv("train_identity.csv", col_types = cols(.default = col_character()))
+
+test_transaction <- read_csv("test_transaction.csv", col_types = char_columns)
+test_identity <- read_csv("test_identity.csv", col_types = cols(.default = col_character()))
+
+num_col <- c(seq(1:12))
+train_identity[,num_col] <- sapply(train_identity[,num_col], as.numeric)
+test_identity[,num_col] <- sapply(test_identity[,num_col], as.numeric)
+
+```
+
+# Structure transaction
+
+## General understanding
+
+```{r structure}
+# Dimension of the data frames
+dim(train_transaction)
+dim(train_identity)
+
+dim(test_transaction)
+dim(test_identity)
+
+# structure of each data frame
+glimpse(train_transaction)
+glimpse(train_identity)
+
+# See if there is duplicate
+get_dupes(train_transaction, TransactionID)
+get_dupes(train_identity, TransactionID)
+
+get_dupes(test_transaction, TransactionID)
+get_dupes(test_identity, TransactionID)
+
+# Are there transactions in identity that don't exist in transaction
+anti_join(train_identity, train_transaction)
+anti_join(test_identity, test_transaction)
+
+# Check for NAs
+sapply(lapply(train_transaction[,names(train_transaction)],is.na),sum)
+sapply(lapply(train_identity[,names(train_identity)],is.na),sum)
+
+sapply(lapply(test_transaction[,names(test_transaction)],is.na),sum)
+sapply(lapply(test_identity[,names(test_identity)],is.na),sum)
+
+```
+
+There are no duplicates, all the data in identity correspond to a transaction.
+There are many NAs, I will study how it can impact, and how to deal with thems (omit, impute, leave as they are)
+
+
+## Study NAs in Transaction data
+
+### Categorical
+
+```{r transaction_categorical}
+
+list_char <- names(train_transaction)[sapply(train_transaction, is.character)]
+
+cross_table <- function(x){
+  list <- train_transaction[,x]
+  print(table(list, useNA = "always"))
+}
+
+
+n_mode <- function(x, data){
+  list <- data[,x]
+  NROW(unique(list))
+  
+}
+
+perc_na <- function(x, data){
+  list <- data[,x]
+  sum(is.na(list)/NROW(list))
+}
+
+
+
+percna <- sapply(list_char, perc_na, train_transaction)
+nmode <- sapply(list_char, n_mode, train_transaction)
+
+na_count <- data.frame(list_char, percna, nmode)
+
+na_count %>%
+  mutate(list_char = fct_reorder(list_char, percna)) %>%
+  ggplot(aes(list_char, percna, fill = percna)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Percentage of NA",
+       subtitle = "per categorical variable",
+       x = "variable",
+       y = "proportion")
+
+na_count %>%
+  mutate(list_char = fct_reorder(list_char, nmode)) %>%
+  ggplot(aes(list_char, nmode, fill = nmode, label = nmode)) +
+  geom_col(alpha = 0.5) +
+  geom_text(color = "white", position = position_stack(vjust = 0.5)) +
+  scale_y_log10(limits = c(1, 100000), labels = comma)+
+  coord_flip() +
+  labs(title = "Number of mode",
+     subtitle = "per categorical variable",
+     x = "variable",
+     y = "log of number")
+
+#sapply(list_char, cross_table)
+
+
+# Card4 and card6 can be completed with a category "Other"
+train_transaction$card4[is.na(train_transaction$card4)] <- "Other"
+train_transaction$card6[is.na(train_transaction$card6)] <- "Other"
+
+# M1 to M9 is not meaningful, and with 281444 it doesn't make sense to impute a value.
+# IP address can't be imputed with another value
+
+na_tbl <- as_tibble(is.na(train_transaction[, list_char])) %>% 
+  bind_cols(dt = train_transaction$TransactionDT, isFraud = train_transaction$isFraud)
+
+na_tbl %>%
+  sample_n(10000) %>%
+  gather(column, value, card1:M9) %>%
+  filter(value == TRUE) %>%
+  ggplot(aes(column, dt, color = column)) +
+  geom_point(alpha = 0.01) +
+  geom_jitter()+
+  labs(title = "Homogeneity of NA over time",
+     x = "variable",
+     y = "time (TransactionDT)")
+# The missing values seem to be distributed all the long of the transaction
+# there are only few missing values for card 3, card4 and card6, and they seem to 
+# appear simultaneously
+
+#  zooming in
+na_tbl %>%
+  sample_n(100000) %>%
+  gather(column, value, card1:M9) %>%
+  filter(value == TRUE, dt > 500000 & dt < 510000) %>%
+  ggplot(aes(column, dt, color = as.factor(isFraud))) +
+  geom_point(alpha = 0.4)+
+  labs(title = "Homogeneity of NA over time",
+     subtitle = "zoom in to see patterns",
+     x = "variable",
+     y = "time (TransactionDT)")
+
+```
+
+Zooming in, it appears that some variable have missing values at the same time (M1, M2, M3, M7, M8, M9), (M4, M5), 
+while others don't (R_emaildomain). Omitting the rows is not an option, because of the difference in pattern, that would increase
+the number of rows, considering that some categorical data already have a lot of missing values.
+big amount in 
+
+Card1 to domain name have a lot of mode, it would create too many new variables to treat them has dummy variables.
+
+Variables M1 to M6 have a lot of missing values.
+
+
+```{r}
+unique_mode <- function(x, data){
+  list <- data[,x]
+  unique(list)
+}
+
+unique_train <- sapply(list_char, unique_mode, train_transaction)
+unique_test <- sapply(list_char, unique_mode, test_transaction)
+
+unique_compare <- function(x, dest, orig){
+  dest[[x]][!(dest[[x]] %in% orig[[x]])]
+}
+
+difference <- sapply(seq(1, length(unique_test)), unique_compare, unique_test, unique_train)
+diff_count <- sapply(difference, NROW)
+
+as_tibble(list(var_name = list_char, num_diff = diff_count)) %>%
+  mutate(toplot = log1p(num_diff),
+         var_name = fct_reorder(var_name, desc(toplot))) %>%
+  ggplot(aes(var_name, toplot, fill = num_diff, label = num_diff)) +
+  geom_col() +
+  geom_text(color = "white", position = position_stack(vjust = 0.5)) +
+  labs(title = "Number of value in test that doesn't exist in train",
+         y = "log scale",
+       x = "variable name") +
+  theme(axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.text.x=element_text(angle=60, hjust=1))
+  
+
+```
+
+3538 values from the test file are not present in the train files.
+It looks like a card identifier, so it is an interesting feature if a card has been identified previously as being used for a Fraud.
+For the test card that don't exist in the train file, it won't add value, so it's important to use an algorithm that can handle
+the situation of having different categories, such as tree based model, that can have trees using card1 and trees not using it.
+
+
+### Numerical Data
+
+```{r}
+
+na_tbl <- as_tibble(is.na(train_transaction))
+
+# https://albertotb.github.io/Benchmark-adding-together-multiple-columns-in-dplyr/#
+# https://stackoverflow.com/questions/28873057/sum-across-multiple-columns-with-dplyr
+
+
+tot_na <- mutate(na_tbl, total = reduce(select(na_tbl, -isFraud), `+`))
+
+#mutate(na_tbl, total = reduce(select(na_tbl), `+`))
+
+na_tbl %>%
+  mutate(total = reduce(select(., -isFraud), `+`)) %>% 
+  select(total) %>%
+  bind_cols(isFraud = train_transaction$isFraud) %>%
+  ggplot((aes(total))) +
+  geom_density(aes(color = as.factor(isFraud)))+
+  labs(title = "Density of number of features with NA",
+       subtitle = "Comparison between Fraud and non Fraud",
+       x = "Number of features with NA")
+
+test_na <- as_tibble(is.na(test_transaction)) %>%
+  mutate(total = reduce(., `+`)) %>% 
+  select(total) %>%
+  bind_cols(data = rep("test", nrow(test_transaction)))
+
+train_na <- as_tibble(is.na(train_transaction)) %>%
+  mutate(total = reduce(., `+`)) %>% 
+  select(total) %>%
+  bind_cols(data = rep("train", nrow(train_transaction)))
+
+train_na %>%
+  bind_rows(test_na) %>%
+  ggplot(aes(total, color = data)) +
+  geom_density()+
+  labs(title = "Density of number of features with NA",
+       subtitle = "Comparison between train and test",
+       x = "Number of features with NA")
+
+# Percentage of NA for each feature
+prop_na_train <- sapply(lapply(train_transaction[,names(train_transaction)],is.na), function(x) {sum(x)/NROW(x)*100}) 
+prop_na_test <- sapply(lapply(test_transaction[,names(test_transaction)],is.na), function(x) {sum(x)/NROW(x)*100})
+
+# remove isFraud from prop_na_train, and do a dataframe (keep column name), plot the density for both
+prop_na_train <- prop_na_train[-2]
+
+prop_na <- tibble(row_num = seq(1,length(prop_na_test),1), variable = names(prop_na_test),train = prop_na_train, test = prop_na_test)
+
+plot_na <- function(df, start, end){
+  df %>%
+  gather(column, value, -c(row_num, variable)) %>%
+  filter(row_num >= start & row_num < end) %>%
+  mutate(variable = fct_reorder(variable, row_num)) %>%
+  ggplot(aes(variable, value, color = column, fill = column)) +
+  geom_col(position = "identity", alpha = 0.4) +
+  labs(title = "Percentage of NA per variable",
+       subtitle = "for each dataset",
+       x = "Variables",
+       y = "Percentage of NA")+
+  theme(axis.text.x=element_text(angle=60, hjust=1))
+}
+
+plot_na(prop_na, 1, 50)
+
+for(i in seq(1, NROW(prop_na_train) %/% 50 + 1, 1)){
+  start = 1 + 50*(i-1)
+  end = start + 50
+  print(plot_na(prop_na, start, end))
+}
+
+
+# Select arbitrary the variables with more than 10% difference.
+sup_10p <- prop_na_train - prop_na_test > 10
+test_transaction[,names(sup_10p)[sup_10p]]
+
+```
+
+The distribution is different between fraud and non fraud, the peaks are located at the same coordonate
+but the distribution is different. This can be useful to help improving the classification.
+
+Between train and test, the distribution is also different, this can be a problem for the model to perform well with the test
+dataset.
+
+From V138 to V278, the percentage of NA is very important, so I might consider dropping these variables.
+From V1 to V94 the number of NA between train and test is really different.
+
+
+In the following part of the EDA, I will compare train and test.
+
+
+# Structure Identity
+
+## Study NA's
+
+```{r}
+list_char <- names(train_identity)[sapply(train_identity, is.character)]
+
+percna <- sapply(list_char, perc_na, train_identity)
+nmode <- sapply(list_char, n_mode, train_identity)
+
+na_count <- data.frame(list_char, percna, nmode)
+
+na_count %>%
+  mutate(list_char = fct_reorder(list_char, percna)) %>%
+  ggplot(aes(list_char, percna, fill = percna)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Percentage of NA",
+       subtitle = "per categorical variable",
+       x = "variable",
+       y = "proportion")
+
+na_count %>%
+  mutate(list_char = fct_reorder(list_char, nmode)) %>%
+  ggplot(aes(list_char, nmode, fill = nmode, label = nmode)) +
+  geom_col(alpha = 0.5) +
+  geom_text(color = "white", position = position_stack(vjust = 0.5)) +
+  scale_y_log10(limits = c(1, 100000), labels = comma)+
+  coord_flip() +
+  labs(title = "Number of unique value",
+     subtitle = "per categorical variable",
+     x = "variable",
+     y = "log of number")
+```
+
+
+## NA distribution between train and test
+
+```{r}
+unique_mode <- function(x, data){
+  list <- data[,x]
+  unique(list)
+}
+
+unique_train <- sapply(list_char, unique_mode, train_identity)
+unique_test <- sapply(list_char, unique_mode, test_identity)
+
+unique_compare <- function(x, dest, orig){
+  dest[[x]][!(dest[[x]] %in% orig[[x]])]
+}
+
+difference <- sapply(seq(1, length(unique_test)), unique_compare, unique_test, unique_train)
+diff_count <- sapply(difference, NROW)
+
+as_tibble(list(var_name = list_char, num_diff = diff_count)) %>%
+  mutate(toplot = log1p(num_diff),
+         var_name = fct_reorder(var_name, desc(toplot))) %>%
+  ggplot(aes(var_name, toplot, fill = num_diff, label = num_diff)) +
+  geom_col() +
+  geom_text(color = "white", position = position_stack(vjust = 0.5)) +
+  labs(title = "Number of value in test that doesn't exist in train",
+         y = "log scale",
+       x = "variable name") +
+  theme(axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.text.x=element_text(angle=60, hjust=1))
+  
+```
+
+
+
+# Variable study - transaction
+
+## Variables C1 to C14
+
+```{r}
+train_transaction %>%
+  sample_n(50000) %>%
+  select(isFraud, C1:C14) %>%
+  gather(column, value, -isFraud) %>%
+  filter(value > 0) %>%  
+  ggplot() +
+  geom_density(aes(value, color = as.factor(isFraud), fill = as.factor(isFraud)), alpha = 0.5) +
+  scale_x_log10() +
+  facet_wrap(~column, scales = "free") +
+  labs(title = "Density for C1 to C14 vs Fraud / Legit",
+       subtitle = "Value <= 0 removed for log scale",
+       x = "values",
+       y = "Density")
+
+test_c <- test_transaction %>%
+  sample_n(50000) %>%
+  select(C1:C14) %>%
+  bind_cols(data = rep("test", 50000))
+
+train_c <- test_transaction %>%
+  sample_n(50000) %>%
+  select(C1:C14) %>%
+  bind_cols(data = rep("train", 50000))
+
+train_c %>%
+  bind_rows(test_c) %>%
+  gather(column, value, -data) %>%
+  filter(value > 0) %>% 
+  ggplot() +
+  geom_density(aes(value, color = as.factor(data), fill = as.factor(data)), alpha = 0.3) +
+  scale_x_log10() +
+  facet_wrap(~column, scales = "free") +
+  labs(title = "Density for C1 to C14 vs Train / Test",
+       subtitle = "Value <= 0 removed for log scale",
+       x = "values",
+       y = "Density")
+
+head(table(train_transaction$C3, train_transaction$isFraud))
+
+vect <- c(rows = seq(1, nrow(train_transaction)))
+test <- train_transaction %>% bind_cols(rows = vect)
+
+test %>%
+  select(rows, TransactionID, isFraud, C1:D14) %>%
+  gather(column, value, C1:C14) %>%
+  replace_na(list(value = 4000)) %>%
+  sample_n(200000) %>%
+  ggplot(aes(rows, value)) +
+  geom_point(aes(color = as.factor(isFraud)), alpha = 0.2) +
+  facet_wrap(~column, scales = "free")
+
+```
+
+
+The distribution are alike between train and test.
+The distribution of the fraud looks smoother than the non fraud, but that can be due to the imbalanced dataset.
+The variable C3 doesn't display fraudulent transaction. This is because almost all the fraud transaction have a value of 0 for C3, which are removed on a log scale.
+
+## Variable D1 to D15
+
+
+```{r}
+
+train_transaction %>%
+  sample_n(50000) %>%
+  select(isFraud, D1:D15) %>%
+  gather(column, value, -isFraud) %>%
+  filter(value > 0) %>%  
+  ggplot() +
+  geom_density(aes(value, color = as.factor(isFraud), fill = as.factor(isFraud)), alpha = 0.5) +
+  scale_x_log10() +
+  facet_wrap(~column, scales = "free")+
+  labs(title = "Density for D1 to D15 vs Fraud / Legit",
+       subtitle = "Value <= 0 removed for log scale",
+       x = "values",
+       y = "Density")
+
+
+test_d <- test_transaction %>%
+  sample_n(50000) %>%
+  select(D1:D15) %>%
+  bind_cols(data = rep("test", 50000))
+
+train_d <- test_transaction %>%
+  sample_n(50000) %>%
+  select(D1:D15) %>%
+  bind_cols(data = rep("train", 50000))
+
+train_d %>%
+  bind_rows(test_d) %>%
+  gather(column, value, -data) %>%
+  filter(value > 0) %>% 
+  ggplot() +
+  geom_density(aes(value, color = as.factor(data), fill = as.factor(data)), alpha = 0.3) +
+  scale_x_log10() +
+  facet_wrap(~column, scales = "free") +
+  labs(title = "Density for D1 to D15 vs Train / Test",
+       subtitle = "Value <= 0 removed for log scale",
+       x = "values",
+       y = "Density")
+
+
+
+vect <- c(rows = seq(1, nrow(train_transaction)))
+test <- train_transaction %>% bind_cols(rows = vect)
+
+test %>%
+  select(rows, TransactionID, isFraud, D1:D15) %>%
+  gather(column, value, D1:D15) %>%
+  replace_na(list(value = 1000)) %>%
+  sample_n(200000) %>%
+  ggplot(aes(rows, value)) +
+  geom_point(aes(color = as.factor(isFraud)), alpha = 0.2) +
+  facet_wrap(~column)
+
+
+```
+
+The distribution shows some difference between fraud and non fraud.
+The distribution is the same between the train and test dataset.
+
+## Amount
+
+ Benford 
+
+```{r}
+library(benford.analysis)
+
+amount.ben <- train_transaction %>% filter(isFraud == 1) %>% select(TransactionAmt)
+amount.ben.ana <- benford(as_vector(amount.ben), number.of.digits = 2)
+plot(amount.ben.ana, except = c("second order", "summation", "mantissa", "chi squared","abs diff", "ex summation", "Legend"), multiple = F) 
+
+
+amount.ben <- train_transaction %>% filter(isFraud == 0) %>% select(TransactionAmt)
+amount.ben.ana <- benford(as_vector(amount.ben), number.of.digits = 2)
+plot(amount.ben.ana, except = c("second order", "summation", "mantissa", "chi squared","abs diff", "ex summation", "Legend"), multiple = F) 
+
+
+amount.ben <- train_transaction %>% select(TransactionAmt)
+amount.ben.ana <- benford(as_vector(amount.ben), number.of.digits = 1)
+plot(amount.ben.ana, except = c("second order", "summation", "mantissa", "chi squared","abs diff", "ex summation", "Legend"), multiple = F) 
+
+```
+
+```{r}
+train_transaction %>%
+  select(isFraud, TransactionAmt) %>%
+  ggplot(aes(TransactionAmt, fill = as.factor(isFraud))) +
+  geom_density(alpha = 0.3) + 
+  scale_x_log10()+
+  labs(title = "Amount distribution",
+       subtitle = "per Fraud/Legit",
+       x = "Amount (log)",
+       y = "Density")
+
+test_amt <- test_transaction %>%
+  select(TransactionAmt) %>%
+  bind_cols(data = rep("test", NROW(test_transaction)))
+
+train_amt <- train_transaction %>%
+  select(TransactionAmt) %>%
+  bind_cols(data = rep("train", NROW(train_transaction)))
+
+train_amt %>%
+  bind_rows(test_amt) %>%
+  ggplot(aes(TransactionAmt, fill = as.factor(data))) +
+  geom_density(alpha = 0.3) + 
+  scale_x_log10(label = comma) +
+  labs(title = "Amount distribution",
+       subtitle = "per dataset",
+       x = "Amount (log)",
+       y = "Density")
+
+```
+
+
+## Date
+
+Idea for the starting date from that kernel :
+https://www.kaggle.com/kevinbonnes/transactiondt-starting-at-2017-12-01
+
+```{r}
+library(lubridate)
+train_dt <- train_transaction$TransactionDT
+
+base_date <- as.numeric(as.POSIXct("2017-12-01", format="%Y-%m-%d"))
+train_dt <- as.POSIXct(train_dt, origin="1970-01-01")
+
+train_dt <- as.POSIXct((base_date+ train_dt), origin="1970-01-01")
+
+unique(wday(train_dt))
+unique(week(train_dt))
+train_transaction$date <- train_dt
+train_transaction$day <- wday(train_dt)
+train_transaction$week <- week(train_dt)
+train_transaction$hour <- hour(train_dt)
+
+
+
+
+train_transaction %>%
+  ggplot(aes((hour+1))) +
+  geom_histogram(aes(y = ..density.., fill = as.factor(isFraud), color =as.factor(isFraud)), alpha = 0.4, breaks = seq(0, 24), position = "identity") + 
+  scale_x_continuous("", limits = c(0, 24), breaks = seq(0, 24)) + 
+  coord_polar()
+
+train_transaction %>%
+  ggplot(aes(hour)) +
+  geom_histogram(aes(y = ..density.., fill = as.factor(isFraud), color =as.factor(isFraud)), alpha = 0.4, breaks = seq(0, 24), position = "identity") + 
+  scale_x_continuous("", limits = c(0, 24), breaks = seq(0, 24)) 
+
+
+```
+
+Guess and match train and test
+
+```{r}
+test_dt <- test_transaction$TransactionDT
+
+base_date <- as.numeric(as.POSIXct("2017-12-01", format="%Y-%m-%d"))
+
+test_dt <- as.POSIXct((base_date+ test_dt), origin="1970-01-01")
+
+unique(wday(test_dt))
+unique(week(test_dt))
+test_transaction$date <- test_dt
+test_transaction$day <- wday(test_dt)
+test_transaction$week <- week(test_dt)
+test_transaction$hour <- hour(test_dt)
+
+
+
+test_transaction %>%
+  ggplot(aes((hour+1))) +
+  geom_histogram(aes(y = ..density..),alpha = 0.4, breaks = seq(0, 24)) + 
+  scale_x_continuous("", limits = c(0, 24), breaks = seq(0, 24)) + 
+  coord_polar()
+
+test_transaction %>%
+  ggplot(aes(hour)) +
+  geom_histogram(aes(y = ..density..),alpha = 0.4, breaks = seq(0, 24), position = "identity") + 
+  scale_x_continuous("", limits = c(0, 24), breaks = seq(0, 24)) 
+
+train_transaction %>%
+  ggplot(aes(hour)) +
+  geom_histogram(aes(y = ..density..), alpha = 0.4, breaks = seq(0, 24), position = "identity") + 
+  scale_x_continuous("", limits = c(0, 24), breaks = seq(0, 24)) 
+
+```
+
+The hours distribution seem to have the same distriution, the hours matches.
+
+```{r}
+train_transaction %>%
+  group_by(day) %>%
+  summarise(tot = n()) %>%
+ggplot(aes(day, tot )) +
+  geom_col()
+
+test_transaction %>%
+  group_by(day) %>%
+  summarise(tot = n()) %>%
+ggplot(aes(day, tot )) +
+  geom_col()
+
+```
+
+The day of the week seems to match.
+
+```{r}
+
+train_transaction %>%
+  group_by(week) %>%
+  summarise(tot = n()) %>%
+ggplot(aes(week, tot )) +
+  geom_col()
+
+test_transaction %>%
+  group_by(week) %>%
+  summarise(tot = n()) %>%
+ggplot(aes(week, tot )) +
+  geom_col()
+
+```
+
+There is only one peak above 30k transaction, let's find which week of the year (probably Christmas), and by how much we need to shift the test data to match it.
+
+```{r}
+train_transaction %>%
+  group_by(week) %>%
+  mutate(n = n()) %>%
+  filter(n > 30000) %>%
+  select(week)
+
+test_transaction %>%
+  group_by(week) %>%
+  mutate(n = n()) %>%
+  filter(n > 30000) %>%
+  select(week)
+
+```
+
+Verification that the distribution looks alike for week, days, and hours.
+
+```{r}
+test_transaction$day <- wday(test_transaction$date)
+test_transaction$week <- week(test_transaction$date)
+test_transaction$hour <- hour(test_transaction$date)
+
+train_check <- train_transaction %>%
+  select(date, week, day, hour) %>%
+  bind_cols(data = rep("train", nrow(train_transaction)))
+
+test_check <- test_transaction %>%
+  select(date, week, day, hour) %>%
+  bind_cols(data = rep("test", nrow(test_transaction)))
+
+# week
+train_check %>%
+  bind_rows(test_check) %>%
+  group_by(data, week) %>%
+  summarise(tot = n()) %>%
+  ggplot(aes(week, tot, color = as.factor(data), fill = as.factor(data))) +
+  geom_col(alpha = 0.3, position = "identity")
+
+# week
+train_check %>%
+  bind_rows(test_check) %>%
+  group_by(data, day) %>%
+  summarise(tot = n()) %>%
+  ggplot(aes(day, tot, color = as.factor(data), fill = as.factor(data))) +
+  geom_col(alpha = 0.3, position = "identity")
+
+# week
+train_check %>%
+  bind_rows(test_check) %>%
+  group_by(data, hour) %>%
+  summarise(tot = n()) %>%
+  ggplot(aes(hour, tot, color = as.factor(data), fill = as.factor(data))) +
+  geom_col(alpha = 0.3, position = "identity")
+
+```
+
+
+Study correlation between dates and D variables
+
+```{r}
+
+library(corrgram)
+train_transaction %>%
+  select(D1:D15, week, day, hour) %>%
+  sample_n(50000) %>%
+  corrgram(
+         cor.method = "spearman",
+         main = "Correlation for date related variables",
+         lower.panel=panel.shade, upper.panel=panel.pie,
+         diag.panel=panel.minmax, text.panel=panel.txt)
+
+```
+
+
+## Card4 & to card6 vs fraud
+
+```{r}
+card_ana <- train_transaction %>%
+  select(isFraud, card1:card6) %>%
+  gather(column, value, -isFraud)
+
+
+
+plot_categorical <-function(df, var){
+  df %>%
+  filter(column == var) %>%
+  group_by(value, isFraud) %>%
+  summarize(tot = n()) %>%
+  ggplot(aes(value, tot, fill = value)) +
+  geom_col(alpha = 0.3, position = "identity") +
+  facet_wrap(~isFraud, scales = "free")+
+    labs(title = paste0(var, " vs Fraud / Legit"),
+         x = "Value",
+         y = "number of transactions")+
+  theme(axis.text.x=element_text(angle=60, hjust=1))
+}
+
+plot_percFraud <- function(df, var){
+  df %>%
+  filter(column == var) %>%
+  group_by(value, isFraud) %>%
+  summarize(tot = n()) %>%
+  spread(isFraud, tot) %>%
+  summarize(perc = `1` / (`0` + `1`)) %>%
+  ggplot(aes(value, perc, fill = value)) +
+  geom_col(alpha = 0.3, position = "identity") +
+    labs(title = paste0(var, " percentage of fraud"),
+         x = "Value",
+         y = "percentage of fraud")+
+  theme(axis.text.x=element_text(angle=60, hjust=1))
+}
+
+for(var in c("card4","card6")){
+  print(paste0("Variable : ", var))
+  print(plot_categorical(card_ana, var))
+  print(plot_percFraud(card_ana, var))
+}
+
+
+```
+
+## M1 - M9 vs Fraud
+
+```{r}
+M_ana <- train_transaction %>%
+  select(isFraud, M1:M9) %>%
+  gather(column, value, -isFraud)
+
+for(var in c("M1","M2","M3","M4","M5","M6","M7","M8","M9")){
+  print(plot_categorical(M_ana, var))
+  print(plot_percFraud(M_ana, var))
+}
+table(train_transaction$M2, train_transaction$isFraud, useNA = "always")
+
+```
+
+There are some significant differences, particularly for M4 (value M2 higher for fraud) and the proportion of NA (M1, M3)
+
+## ProductCD
+
+```{r}
+Pcd_ana <- train_transaction %>%
+  select(isFraud, ProductCD) %>%
+  gather(column, value, -isFraud)
+
+ print(plot_categorical(Pcd_ana, "ProductCD"))
+ print(plot_percFraud(Pcd_ana, "ProductCD"))
+```
+
+The ProductCD with a value of C has a higher percentage of Fraud.
+
+
+
+# Variable study - Identity
+
+Add transaction variables to identity
+
+```{r}
+train_identity <- train_identity %>%
+  left_join(select(train_transaction, TransactionID, isFraud, TransactionAmt))
+```
+
+## Fraud repartition per categorical variable
+
+exclusion of variables with only numeric values or two many values (DeviceInfo)
+
+```{r}
+id_ana <- train_identity %>%
+  select(isFraud, id_12, id_15, id_16, id_28, id_29, id_34:id_38) %>%
+  gather(column, value, -isFraud)
+
+for(var in c("id_12","id_15","id_16","id_28","id_29","id_34","id_35","id_36","id_37", "id_38")){
+  print(plot_categorical(id_ana, var))
+  print(plot_percFraud(id_ana, var))
+}
+table(train_transaction$M2, train_transaction$isFraud, useNA = "always")
+```
+
+Fraud repartition depending of the presence of identity 
+
+```{r}
+
+train_transaction_id <- train_identity %>%
+  mutate(hasid = 1) %>%
+  select(TransactionID, hasid) %>%
+  right_join(train_transaction) %>%
+  mutate(hasid = ifelse(is.na(hasid), 5, 6))
+
+
+prop.table(table(train_transaction_id$isFraud, train_transaction_id$hasid), margin = 2)
+
+train_transaction_id %>%
+  group_by(hasid, isFraud) %>%
+  summarize(tot = n()) %>%
+  spread(isFraud, tot) %>%
+  summarize(perc = `1` / (`0` + `1`)) %>%
+  ggplot(aes(as.factor(hasid), perc, fill = as.factor(hasid))) +
+  geom_col(alpha = 0.3, position = "identity") +
+    labs(title = paste0(var, "percentage of fraud if identity"),
+         x = "Has an id ",
+         y = "percentage of fraud")+
+  theme(axis.text.x=element_text(angle=60, hjust=1))
+
+
+```
+
+
+There are 7.84 % of fraudlent transaction for the transaction with idendity 
+versus 2.1% for the transaction with no identity.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r eval=FALSE, include=FALSE}
+
+save.image(file = "c:\\temp\\ieee_rmd.RData")
+
+load("c:\\temp\\ieee_rmd.RData")
+```
+
+
+
+# DRAFT
+
+
+
+```{r eval=FALSE, include=FALSE}
+plot_percFraud <- function(df, var){
+  df %>%
+  filter(column == var) %>%
+  group_by(value, isFraud) %>%
+  summarize(tot = n()) %>%
+  spread(isFraud, tot) %>%
+  summarize(perc = `1` / `0`) %>%
+  ggplot(aes(value, perc, fill = value)) +
+  geom_col(alpha = 0.3, position = "identity") +
+    labs(title = paste0(var, " percentage of fraud"),
+         x = "Value",
+         y = "percentage of fraud")+
+  theme(axis.text.x=element_text(angle=60, hjust=1))
+}
+
+```
+
+
+
+```{r eval=FALSE, include=FALSE}
+
+card_ana %>%
+  filter(column == "card1") %>%
+  group_by(value, isFraud) %>%
+  summarize(tot = n()) %>%
+  filter(tot >=2, isFraud == 1) %>%
+  ggplot(aes(value, tot, color = as.factor(isFraud), fill = as.factor(isFraud))) +
+  geom_col(alpha = 0.3, position = "identity")
+
+
+```
+
